@@ -1,0 +1,8 @@
+pyproject.toml
+src/research/__init__.py
+src/research/cli.py
+src/research.egg-info/PKG-INFO
+src/research.egg-info/SOURCES.txt
+src/research.egg-info/dependency_links.txt
+src/research.egg-info/top_level.txt
+tests/test_cli.py
