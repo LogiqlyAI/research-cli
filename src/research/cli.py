@@ -3,6 +3,7 @@ import sys
 import json
 import textwrap
 import argparse
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
@@ -24,7 +25,60 @@ class TruncatedResponseError(Exception):
     """Raised when the model's response is cut off by the token limit."""
     pass
 
-def get_report(question: str, model: str = DEFAULT_MODEL, max_tokens: int = DEFAULT_MAX_TOKENS) -> Report:
+class ConfigError(Exception):
+    """Raised when configuration (env, args, etc.) is invalid."""
+    pass
+
+@dataclass
+class Config:
+    """Resolved configuration for the research tool."""
+    model: str
+    max_tokens: int
+
+def _parse_int_gracefully(value: str, name: str) -> int:
+    """Parse an integer from a string, raising ConfigError on failure."""
+    try:
+        return int(value)
+    except ValueError:
+        raise ConfigError(f"{name} must be an integer, got: {value!r}")
+    
+def resolve_config(args: argparse.Namespace) -> Config:
+    """Resolve configuration from CLI flags, environment variables, and defaults.
+    
+    Precedence (highest to lowest):
+        1. CLI flags (--model, --max-tokens) - only if explicitly provided
+        2. Environment variables (RESEARCH_MODEL, RESEARCH_MAX_TOKENS)
+        3. Built-in defaults (DEFAULT_MODEL, DEFAULT_MAX_TOKENS)
+
+    Raises:
+        ConfigError: if any configuration is invalid (e.g., missing API key, bad max_tokens, etc.)
+    """
+    load_dotenv()  # Idempotent - safe to call multiple times
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ConfigError("ANTHROPIC_API_KEY not found. Set it with: export ANTHROPIC_API_KEY='your-key' or create a .env file.")
+
+    model = (
+        args.model
+        if args.model is not None 
+        else os.getenv("RESEARCH_MODEL") or DEFAULT_MODEL
+    )
+
+    env_max_tokens = os.getenv("RESEARCH_MAX_TOKENS")
+    if args.max_tokens is not None:
+        max_tokens = args.max_tokens
+    elif env_max_tokens is not None:
+        max_tokens = _parse_int_gracefully(env_max_tokens, "RESEARCH_MAX_TOKENS")
+    else:
+        max_tokens = DEFAULT_MAX_TOKENS
+
+    if max_tokens < 1:
+        raise ConfigError(f"max-tokens must be at least 1, got: {max_tokens}")
+
+    return Config(model=model, max_tokens=max_tokens)
+
+def get_report(question: str, config: Config) -> Report:
     """Ask Claude and return a validated Report
     
        Raises:
@@ -33,14 +87,14 @@ def get_report(question: str, model: str = DEFAULT_MODEL, max_tokens: int = DEFA
           anthropic.APIError: for API-level failures.
           ValidationError: if the model's output doesn't match the Report schema. 
     """
-    if not question.strip():
+    if not question or not question.strip():
         raise ValueError("Question cannot be empty.")
 
     client = anthropic.Anthropic()
     response = client.messages.parse(
-        model=model,
+        model=config.model,
         system=SYSTEM_PROMPT,
-        max_tokens=max_tokens,
+        max_tokens=config.max_tokens,
         messages=[
             {
                 "role": "user",
@@ -51,7 +105,7 @@ def get_report(question: str, model: str = DEFAULT_MODEL, max_tokens: int = DEFA
     )
 
     if response.stop_reason == "max_tokens":
-        raise TruncatedResponseError(f"Response truncated at {max_tokens} tokens. Increase --max-tokens.")
+        raise TruncatedResponseError(f"Response truncated at {config.max_tokens} tokens. Increase --max-tokens.")
 
     return response.parsed_output
 
@@ -78,11 +132,6 @@ def render(report: Report) -> None:
     print("=" * 80)
 
 def main() -> None:
-    load_dotenv()
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("Error: ANTHROPIC_API_KEY not found in environment or .env file. Set it with: export ANTHROPIC_API_KEY='your-key' or create a .env file.", file=sys.stderr)
-        sys.exit(1)
 
     parser = argparse.ArgumentParser(
         description="Ask Claude a question and get a structured report."
@@ -94,13 +143,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
         help=f"Model to use (default: {DEFAULT_MODEL})"
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=DEFAULT_MAX_TOKENS,
         help=f"Maximum tokens for the response (default: {DEFAULT_MAX_TOKENS})"
     )
     parser.add_argument(
@@ -111,25 +158,27 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if not args.question:
+    if not args.question or not args.question.strip():
         parser.print_help()
         sys.exit(1)
 
-    if args.max_tokens < 1:
-        print("Error: --max-tokens must be at least 1.", file=sys.stderr)
+    try:
+        config = resolve_config(args)
+    except ConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
-        report = get_report(args.question, model=args.model, max_tokens=args.max_tokens)
+        report = get_report(question=args.question, config=config)
     except ValidationError as e:
-            print(f"Schema validation error – the model return unexpected structure:\n{e}", file=sys.stderr)
-            sys.exit(1)
+        print(f"Schema validation error – the model return unexpected structure:\n{e}", file=sys.stderr)
+        sys.exit(1)
     except ValueError as e:
         print(f"Input error: {e}", file=sys.stderr)
         sys.exit(1)
     except TruncatedResponseError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except anthropic.APIError as e:
         print(f"API error: {e}", file=sys.stderr)
         sys.exit(1)
